@@ -11,7 +11,7 @@
 <#@ include file="TTCSharpUtility.tt" #>
 <#@ output extension=".cs" #>
 <#
-	var connectionString = @"Data Source=(LocalDB)\v11.0;AttachDbFilename=C:\Users\Kazuhiko\Documents\GitHub\T4Adonet\Kazuk.T4Adonet\TargetDb.mdf;Integrated Security=True";
+	var connectionString = @"Data Source=(LocalDb)\v11.0;Initial Catalog=t4adonetTest;Integrated Security=True;Pooling=False";
 
 	var literalContainer = new Dictionary<string,string>();
 	
@@ -25,15 +25,13 @@ select * from sys.columns
 			ClassName = "TablesCommand",
 			CommandText = literalContainer["TablesQuery"],
 			Parameters = new ParameterNameAndTypeList {
-				{ "tableName", typeof(string) }
+				{ "tableName", typeof(string) , SqlDbType.VarChar }
 			}
 		},
 	};
 
 	var namespaceName = "T4Adonet.Samples";
 
-	GCOptimizeForStringColumn = 
-		(className, resultSetIndex, columnName) => true;
 
 #>
 /* --------------------------------------------------------
@@ -44,8 +42,11 @@ select * from sys.columns
 
  ------------------------------------------------------- */
 using System;
+using System.Data;
 using System.Data.SqlClient;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
+
 // ReSharper disable CheckNamespace
 // ReSharper disable PartialTypeWithSinglePart
 // ReSharper disable InconsistentNaming
@@ -56,106 +57,46 @@ using System.Collections.Generic;
 	{
 		foreach( var cmdDef in commands )
 		{
-			using( SqlConnection conn = new SqlConnection( connectionString ) )
-			{
-				using(var cls=BeginClass( cmdDef.ClassName, @partial: true, interfaces: new[]{ "IDisposable" } ) )
-				{
-					GenerateCommandClassContent( cmdDef, cls );
-					conn.Open();
-					SqlCommand cmd = new SqlCommand( cmdDef.CommandText,conn );
-					// スキーマだけほしいので null パラメータを使ってコマンドを投げています
-					foreach( var param in cmdDef.Parameters )
-					{
-						cmd.Parameters.AddWithValue( param.Name, null );
-					}
-					cmd.CommandType = CommandType.Text;
-					bool generateBufferManager = false;
-					using( var reader = cmd.ExecuteReader( CommandBehavior.SchemaOnly ) )
-					{
-						int resultCnt =0;
-						do {
-							var schema = reader.GetSchemaTable();
-							GenerateResultSetStruct( cmdDef.ClassName, schema, resultCnt );
-							generateBufferManager |= GenerateFetcher(cmdDef.ClassName, schema, resultCnt);
-							resultCnt++;
-						} while( reader.NextResult() );
-						if( resultCnt==1 )
-						{
-#>
-		public IEnumerable<ResultSet0> Fetch( SqlDataReader reader )
-		{
-			return Fetch0( reader );
-		}
-<#
-						}
-					}
-					if( generateBufferManager ) {
-#>
-public struct StringBuffer
-{
-    public int length;
-    public char[] buffer;
-}
-
-private const int bufferStep = 64;
-private static readonly Dictionary<int,Stack<char[]>> _reservedBuffers
-    = new Dictionary<int,Stack<char[]>>();
-
-private StringBuffer GetBufferFor( SqlDataReader reader, int ordinal )
-{
-    var length = reader.GetChars( ordinal,0,null,0,0 );
-    var bufferBlock =(int) length / bufferStep;
-    Stack<char[]> buffers;
-    lock( _reservedBuffers ) 
-    {
-        if( !_reservedBuffers.TryGetValue( bufferBlock,out buffers ) )
-        {
-            buffers = new Stack<char[]>();
-            _reservedBuffers.Add( bufferBlock, buffers );
-        }
-    }
-    char[] buffer;
-    lock( buffers ) 
-    {
-        buffer = buffers.Count!=0 
-            ? buffers.Pop() 
-            : new char[(bufferBlock+1)*bufferStep];
-    }
-    reader.GetChars( ordinal,0,buffer,0,(int)length );
-    return new StringBuffer() { 
-        length = (int) length, 
-        buffer = buffer };
-}
-
-private void ReleaseBuffer(StringBuffer buffer)
-{
-    if( buffer.buffer==null ) return;
-
-    var bufferBlock = buffer.length / bufferStep;
-    Stack<char[]> buffers;
-    lock( _reservedBuffers )
-    {
-        if( !_reservedBuffers.TryGetValue( bufferBlock,out buffers ) )
-        {
-            buffers = new Stack<char[]>();
-            _reservedBuffers.Add( bufferBlock, buffers );
-        }
-    }
-	lock( buffers )
-	{
-		buffers.Push( buffer.buffer );
-	}
-}
-<#
-					}
-				}
-			}
+			GenerateSelectCommand(cmdDef,connectionString);
 		}
 	}
 #>
 
 <#+
-	Func<string,int,string,bool> GCOptimizeForStringColumn { get; set; }
+	void GenerateSelectCommand( SelectCommandDefinition cmdDef, string connectionString )
+	{
+		using( SqlConnection conn = new SqlConnection( connectionString ) )
+		{
+			using(var cls=BeginClass( cmdDef.ClassName, @partial: true, interfaces: new[]{ "IDisposable" } ) )
+			{
+				GenerateCommandClassContent( cmdDef, cls );
+				conn.Open();
+				SqlCommand cmd = new SqlCommand( cmdDef.CommandText,conn );
+				// スキーマだけほしいので null パラメータを使ってコマンドを投げています
+				foreach( var param in cmdDef.Parameters )
+				{
+					cmd.Parameters.AddWithValue( param.Name, null );
+				}
+				cmd.CommandType = CommandType.Text;
+				using( var reader = cmd.ExecuteReader( CommandBehavior.SchemaOnly ) )
+				{
+					int resultCnt =0;
+					do {
+						var schema = reader.GetSchemaTable();
+						GenerateResultSetStruct( cmdDef.ClassName, schema, resultCnt );
+						GenerateFetcher(cmdDef.ClassName, schema, resultCnt);
+						resultCnt++;
+					} while( reader.NextResult() );
+					if( resultCnt==1 )
+					{
+						PushIndent("        ");
+						CreatePrimaryFetcher();
+						PopIndent();
+					}
+				}
+			}
+		}
+	}
 
 	public class SelectCommandDefinition
 	{
@@ -168,85 +109,156 @@ private void ReleaseBuffer(StringBuffer buffer)
 	{
 		readonly string _name;
 		readonly Type _type;
+		readonly SqlDbType _sqlDbType;
 
-		public ParameterNameAndType( string name, Type type)
+		public ParameterNameAndType( string name, Type type, SqlDbType sqlDbType )
 		{
 			_name = name;
 			_type = type;
+			_sqlDbType = sqlDbType;
 		}
 
 		public string Name { get { return _name; } }
 		public Type Type { get { return _type; } }
+		public SqlDbType SqlDbType { get { return _sqlDbType; }}
 	}
 
 	public class ParameterNameAndTypeList : List<ParameterNameAndType>
 	{
-		public void Add( string parameterName, Type type )
+		public void Add( string parameterName, Type type, SqlDbType sqlDbType  )
 		{
-			Add( new ParameterNameAndType( parameterName, type ) );
+			Add( new ParameterNameAndType( parameterName, type, sqlDbType ) );
 		}
 	}
 
 	void GenerateCommandClassContent( SelectCommandDefinition cmdDef, ClassContext cls )
 	{
-		DeclareConst( "CommandText", "string", ()=>{
-			using( BeginDisableIndent() ) {
-				#><#=ToVerbatimString(cmdDef.CommandText)#><#+ 
-			} } );
+		GenerateCommandTextConstant( cmdDef.CommandText );
+
+		GeneratePreparedCommandField();
+
 		DeclareField( "_sqlCommand", "SqlCommand", @readonly:true );
-		DeclareField( "_preparedCommand", "System.Collections.Concurrent.ConcurrentStack<SqlCommand>",
-			@readonly: true, 
-			@static:true, 
-			initializer :
-				()=> {#>new System.Collections.Concurrent.ConcurrentStack<SqlCommand>()<#+} );
 
 		foreach( var param in cmdDef.Parameters )
 		{
 			DeclareField( "_param_"+param.Name, "SqlParameter", @readonly:true );
 		}
 
-						DeclareConstractor( cls, 
+		DeclareConstractor( cls, 
 					parameters: new[] { new { Name="conn", Type="SqlConnection" } },
-					body: () => {
-#>
-SqlCommand command;
-if( !_preparedCommand.TryPop( out command ) )
-{
-    _sqlCommand = new SqlCommand( CommandText, conn ); 		
-<#+						Generate( cmdDef.Parameters, param=>{#>
-    _param_<#=param.Name#> = new SqlParameter();
-<#+							});#>
-    _sqlCommand.Parameters.AddRange( 
-        new [] 
-        {
-<#+						Generate( cmdDef.Parameters, ", ", param=>{#>
-            _param_<#=param.Name#>
-<#+							});#>
-        } );
-}
-else
-{
-    command.Connection = conn;
-<#+
-						Generate( cmdDef.Parameters, (param,index)=>{#>
-    _param_<#=param.Name#>= command.Parameters[<#=index#>];
-<#+							});#>
-    _sqlCommand = command;
-}
-<#+				} );
-				DeclareMethod( "Dispose", "void",access: "public",
-					body: ()=>{#>
-Dispose(true);
-<#+					});
+					body: () => { GenerateConstructorBody(cmdDef); } );
+		GenerateDisposableMethods(cls);
 
-				DeclareFinalizer( cls,
-					body: ()=>{#>
-Dispose(false);
-<#+					});
-				DeclareField( "_disposed", "bool" );
-				DeclareMethod( "Dispose", "void",
+		DeclareMethod( "Execute", "SqlDataReader", 
+					parameters: cmdDef.Parameters.Select(p=> new { Name=p.Name, Type=p.Type.Name }),
+					body: ()=>{ GenerateExecuteMethodBody(cmdDef); });
+	}
+
+	void GenerateDisposableMethods(ClassContext cls)
+	{
+		DeclareMethod( "Dispose", "void",access: "public",
+					body: GenerateDisposableDisposeBody );
+		DeclareFinalizer( cls,
+					body: GenerateFinalizerBody );
+		DeclareField( "_disposed", "bool" );
+		DeclareMethod( "Dispose", "void",
 					parameters: new[] { new { Name="disposing",Type="bool" } },
-					body: ()=>{
+					body: GenerateDisposeBoolBody );
+		DeclareMethod( "ThrowIfDisposed", "void", access:"private",
+					body: GenerateThrowIfDisposedBody );	
+	}
+
+	public void GenerateCommandTextConstant( string commandText )
+	{
+		DeclareConst( "CommandText", "string", ()=>{
+			using( BeginDisableIndent() ) { Write( ToVerbatimString(commandText) ); } } );
+	}
+
+	public void GeneratePreparedCommandField()
+	{
+		DeclareField( "_preparedCommand", "ConcurrentStack<SqlCommand>",
+			@readonly: true, 
+			@static:true, 
+			initializer : ()=> { Write( "new ConcurrentStack<SqlCommand>()" ); } );
+	}
+
+	public void GenerateFetcher( string className,  DataTable schema, int resultCnt )
+	{
+		GenerateFetcherHead( resultCnt );
+		GenerateFetcherBody(schema);
+		GenerateFetcherTail();
+	}
+
+	public void GenerateFetcherBody( DataTable schema )
+	{
+		Generate( schema.Rows.Cast<DataRow>(), row=> {
+			bool isAllowDbNull = (bool)row["AllowDbNull"];
+			string columnName =(string) row["ColumnName"];
+			int columnOrdinal = (int)row["ColumnOrdinal"];
+			Type columnDataType = (Type)row["DataType"];
+			GenerateFetchColumn( columnName, columnDataType, isAllowDbNull, columnOrdinal );
+		});
+	}
+
+	public void GenerateResultSetStruct( string className, DataTable schema,int resultCnt )
+	{
+		DeclareStruct( string.Format("ResultSet{0}", resultCnt ), () => {
+			Generate( schema.Rows.Cast<DataRow>(), CreateResultSetProperty );
+		} );
+	}
+
+	public void CreateResultSetProperty( DataRow row )
+	{
+		var isAllowDbNull = (bool)row["AllowDbNull"];
+		var dataType = (Type)row["DataType"];
+		var columnName = (string) row["ColumnName"];
+		CreateResultSetProperty( dataType, isAllowDbNull, columnName );
+	}
+
+	public void GenerateFetchColumn( string columnName, Type columnDataType, bool isAllowDbNull, int columnOrdinal )
+	{
+		string propertyName = ToPropertyName( columnName );
+		string getterName = GetterOf(columnDataType);
+
+		if( !isAllowDbNull )
+		{
+			GenerateFetchColumnNotNull( propertyName, columnOrdinal, getterName );
+		}
+		else
+		{
+			GenerateFetchColumnNullable( propertyName, columnDataType, columnOrdinal, getterName );
+		}
+	}
+
+	public void GenerateConstructorBody(SelectCommandDefinition cmdDef)
+	{
+		var cmdParams = cmdDef.Parameters;
+		WriteLine( "SqlCommand command;" );
+		GenerateIfElse( ()=>{ Write( "!_preparedCommand.TryPop( out command )" ); },
+			()=>{ GeneratePreparedCommandNotPopped(cmdParams);},
+			()=>{ GeneratePreparedCommandPopped(cmdParams); } );
+	}
+
+
+
+
+
+	public void GenerateFinalizerBody()
+	{
+#>
+Dispose(false);
+<#+
+	}
+
+	public void GenerateDisposableDisposeBody()
+	{
+#>
+Dispose(true);
+<#+
+	}
+
+	public void GenerateDisposeBoolBody()
+	{
 #>
 if( _disposed ) return;
 if( disposing )
@@ -256,32 +268,68 @@ if( disposing )
 	GC.SuppressFinalize( this );
 }
 _disposed = true;
-<#+					});
-				DeclareMethod( "ThrowIfDisposed", "void", access:"private",
-					body: ()=>{
+<#+	
+	}
+
+	public void GenerateThrowIfDisposedBody()
+	{
 #>
 if( _disposed ) throw new ObjectDisposedException(GetType().FullName);
-<#+					});
-				DeclareMethod( "Execute", "SqlDataReader", 
-					parameters: cmdDef.Parameters.Select(p=> new { Name=p.Name, Type=p.Type.Name }),
-					body: ()=>{
+<#+
+	}
+
+	public void GeneratePreparedCommandNotPopped( IEnumerable<ParameterNameAndType> cmdParams )
+	{
+#>
+_sqlCommand = new SqlCommand( CommandText, conn ); 		
+<#+	
+		GenerateParameterCreate( cmdParams ); 
+#>
+_sqlCommand.Parameters.AddRange( 
+    new [] { <#+ Generate( cmdParams, ", ", param=>{#>_param_<#=param.Name#><#+ });#> } );
+<#+
+	}
+
+	public void GeneratePreparedCommandPopped( IEnumerable<ParameterNameAndType> cmdParams )
+	{
+#>
+command.Connection = conn;
+<#+	
+		GenerateParameterCopy( cmdParams );	
+#>
+_sqlCommand = command;
+<#+
+	}
+
+	public void GenerateParameterCreate( IEnumerable<ParameterNameAndType> cmdParams )
+	{
+		Generate( cmdParams, param=>{#>
+_param_<#=param.Name#> = new SqlParameter( "<#=param.Name#>",SqlDbType.<#=param.SqlDbType#> );
+<#+		
+		});
+	}
+
+	public void GenerateParameterCopy( IEnumerable<ParameterNameAndType> cmdParams )
+	{
+		Generate( cmdParams, (param,index)=>{#>
+_param_<#=param.Name#>= command.Parameters[<#=index#>];
+<#+	});
+	}
+
+	public void GenerateExecuteMethodBody(SelectCommandDefinition cmdDef)
+	{
 #>
 ThrowIfDisposed();
 <#+
-						Generate( cmdDef.Parameters,param=>{#>
+	Generate( cmdDef.Parameters,param=>{#>
 _param_<#=param.Name#>.Value = <#=param.Name#>;
-<#+
-							});
-#>
+<#+ }); #>
 return _sqlCommand.ExecuteReader( );
-<#+					});
-
+<#+
 	}
 
-
-	public bool GenerateFetcher( string className,  DataTable schema, int resultCnt )
+	public void GenerateFetcherHead( int resultCnt )
 	{
-		bool generateBufferManager = false;
 #>
 public IEnumerable<ResultSet<#=resultCnt#>> Fetch<#=resultCnt#>( SqlDataReader reader )
 {
@@ -290,100 +338,49 @@ public IEnumerable<ResultSet<#=resultCnt#>> Fetch<#=resultCnt#>( SqlDataReader r
         var record= new ResultSet<#=resultCnt#> 
         {
 <#+
-		foreach( DataRow row in schema.Rows )
-		{
-			if( ((Type)row["DataType"])==typeof(string) 
-				&& GCOptimizeForStringColumn( className, resultCnt, (string)row["ColumnName"] ) )
-			{
-				generateBufferManager = true;
-				if( !((bool)row["AllowDbNull"]) )
-				{
-#>
-            <#=ToPropertyName( (string) row["ColumnName"] )#>=GetBufferFor( reader, <#=row["ColumnOrdinal"]#> ),
-<#+
-				}
-				else
-				{
-#>
-            <#=ToPropertyName( (string) row["ColumnName"] )#>= reader.IsDBNull( <#=row["ColumnOrdinal"]#> )
-                ? default( StringBuffer )
-                : GetBufferFor( reader, <#=row["ColumnOrdinal"]#> ),
-<#+
-				}
-			} 
-			else {
-				if( !((bool)row["AllowDbNull"]) )
-				{
-#>
-            <#=ToPropertyName( (string) row["ColumnName"] )#>=reader.<#= GetterOf((Type)row["DataType"])#>(<#=row["ColumnOrdinal"]#>),
-<#+
-				}
-				else
-				{
-#>
-            <#=ToPropertyName( (string) row["ColumnName"] )#>= reader.IsDBNull(<#=row["ColumnOrdinal"]#>)
-                ? default(<#=row["DataType"]#>)
-                : reader.<#= GetterOf((Type)row["DataType"])#>(<#=row["ColumnOrdinal"]#>),
-<#+
-				}
-			}
-		}
+		PushIndent("            ");
+	}
+
+	public void GenerateFetcherTail( )
+	{
+		PopIndent();
 #>
         };
         yield return record;
-<#+
-		if( generateBufferManager ) 
-		{
-			foreach( DataRow row in schema.Rows )
-			{
-				if( ((Type)row["DataType"])==typeof(string) 
-					&& GCOptimizeForStringColumn( className, resultCnt, (string)row["ColumnName"] ) )
-				{
-#>
-        ReleaseBuffer( record.<#=ToPropertyName( (string) row["ColumnName"] )#>);
-<#+
-				}
-			}
-		}
-#>
     }
 }
 <#+
-		return generateBufferManager;
 	}
 
-	public void GenerateResultSetStruct( string className, DataTable schema,int resultCnt )
+	public void GenerateFetchColumnNotNull(string propertyName, int columnOrdinal, string getterName )
 	{
 #>
-public struct ResultSet<#=resultCnt#>
+<#=propertyName#>=reader.<#= getterName#>(<#=columnOrdinal#>),
+<#+
+	}
+
+	public void GenerateFetchColumnNullable( string propertyName, Type columnDataType, int columnOrdinal, string getterName )
+	{
+#>
+<#=propertyName#>= reader.IsDBNull(<#=columnOrdinal#>)
+    ? default(<#=columnDataType#>)
+    : reader.<#= getterName#>(<#=columnOrdinal#>),
+<#+	
+	}
+
+	public void CreateResultSetProperty( Type dataType, bool isAllowDbNull, string columnName )
+	{
+#>
+public <#=dataType#><#=isAllowDbNull && dataType!=typeof(string) ? "?" : ""#> <#=ToPropertyName( columnName )#> { get; internal set; }
+<#+
+	}
+
+	public void CreatePrimaryFetcher()
+	{
+#>
+public IEnumerable<ResultSet0> Fetch( SqlDataReader reader )
 {
-<#+
-		foreach( DataRow row in schema.Rows )
-		{
-			if( ((Type)row["DataType"])==typeof(string) 
-				&& GCOptimizeForStringColumn( className, resultCnt, (string)row["ColumnName"] ) )
-			{
-#>
-    public StringBuffer <#=ToPropertyName( (string) row["ColumnName"] )#> { get; internal set; }
-<#+
-			}
-			else 
-			{
-				if( (bool)row["AllowDbNull"] && ((Type)row["DataType"])!=typeof(string) )
-				{
-#>
-    public <#=row["DataType"]#>? <#=ToPropertyName( (string) row["ColumnName"] )#> { get; internal set; }
-<#+
-				}
-				else
-				{
-#>
-    public <#=row["DataType"]#> <#=ToPropertyName( (string) row["ColumnName"] )#> { get; internal set; }
-<#+
-				}
-			}
-		}
-#>
+	return Fetch0( reader );
 }
 <#+
 	}
