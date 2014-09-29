@@ -216,6 +216,45 @@ namespace <#=namespaceName#>
 <#=access#> const <#=typeName#> <#=constName#> = <#+ value(); #>;
 <#+
 	}
+
+	public void DeclareStruct( string structName, Action body)
+	{
+#>
+public struct <#=structName#>
+{
+<#+
+		PushIndent("    ");
+		body();
+		PopIndent();
+#>
+}
+<#+
+
+	}
+
+
+	public void GenerateIfElse( Action ifCondition, Action thenPart, Action elsePart )
+	{
+#>
+if( <#+ ifCondition(); #> )
+{
+<#+
+		PushIndent("    ");
+		thenPart();
+		PopIndent();
+#>
+}
+else
+{
+<#+
+		PushIndent("    ");
+		elsePart();
+		PopIndent();
+#>
+}
+<#+
+	}
+
 /*
 
 BeginDisableIndent implementation.
